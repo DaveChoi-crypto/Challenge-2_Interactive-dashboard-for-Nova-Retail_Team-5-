@@ -14,10 +14,12 @@ Run locally with:  streamlit run app.py
 from datetime import date
 from pathlib import Path
 
+import openai
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+from openai import OpenAI
 
 
 # =============================================================================
@@ -48,7 +50,7 @@ SEGMENT_COLORS = {
 }
 OTHERS_COLOR = "#8c8b86"
 SEQUENTIAL_SCALE = ["#cde2fb", "#86b6ef", "#3987e5", "#1c5cab", "#0d366b"]
-GRID_COLOR = "#e6e5e0"
+GRID_COLOR = "rgba(128, 128, 128, 0.25)"   # recessive in both light and dark themes
 
 AGE_ORDER = ["18-24", "25-34", "35-44", "45-54", "55+"]
 AGE_FIXES = {"55-64": "55+"}
@@ -82,16 +84,49 @@ CATEGORY_ORDER = list(CATEGORY_GROUPS.keys())
 LOW_SAT_THRESHOLD = 2     # satisfaction <= 2 counts as "low"
 MIN_RELIABLE_N = 10       # warn when a figure rests on fewer purchase lines
 
-# Tab list. Step 2 inserts "Ask the Data (AI)" between
-# "Region, Category & Channel" and "Data Table & Download".
 TAB_NAMES = [
     "Overview",
     "Segments & Growth Opportunities",
     "Early Warning Signs",
     "Region, Category & Channel",
+    "Ask the Data (AI)",
     "Data Table & Download",
     "About the Data",
 ]
+
+# --- AI assistant (Groq, OpenAI-compatible API) ---
+PROVIDER_NAME = "Groq"
+GROQ_BASE_URL = "https://api.groq.com/openai/v1"
+DEFAULT_MODEL = "openai/gpt-oss-120b"
+FALLBACK_MODELS = ["openai/gpt-oss-20b"]   # tried in order if a model is retired
+HISTORY_LENGTH = 6                          # past messages sent with each question
+SUGGESTED_QUESTIONS = [
+    "Which segment generates the most revenue?",
+    "What early warning signs do you see in the Decline segment?",
+    "Where should we focus investment to grow revenue?",
+]
+MODEL_UNAVAILABLE_PHRASES = [
+    "not found", "decommissioned", "deprecated", "does not exist",
+    "not available", "model_not_found", "model_decommissioned",
+]
+SYSTEM_PROMPT = """You are a concise data assistant for NovaRetail's Customer Intelligence team, \
+working for Sophia Martinez, Director of Customer Intelligence.
+
+Rules:
+- Answer ONLY from the DATA SUMMARY below. It reflects the user's current sidebar filters. \
+When the filters are not "all", start your answer by naming the filters it is based on.
+- Amounts are revenue in U.S. dollars. Rows are purchase lines, not customers; say "customers" \
+only for unique customer counts.
+- The data is a small sample (about 34 customers over about five weeks in early 2023). When a \
+figure rests on fewer than 10 purchase lines, say so.
+- When asked for recommendations, base each one on specific numbers from the summary and label \
+it as a suggestion for Sophia's team to evaluate.
+- If a question cannot be answered from the data (profit, costs, margins, customer lifetime, \
+other years, reasons behind a customer's behavior), say so and name the data that would be needed.
+- Use $ and thousands separators, double-check arithmetic, and keep answers short.
+
+DATA SUMMARY
+{context}"""
 
 # Sidebar multiselect filters: (label, dataframe column, session-state key).
 MULTISELECT_FILTERS = [
@@ -216,8 +251,8 @@ def reset_filters(defaults: dict) -> None:
         st.session_state[key] = value
 
 
-def render_sidebar(df: pd.DataFrame) -> dict:
-    """Draw the sidebar filters and return the active selections."""
+def render_sidebar(df: pd.DataFrame) -> tuple[dict, str]:
+    """Draw the sidebar filters; return the selections and a readable summary."""
     defaults = filter_defaults(df)
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
@@ -244,10 +279,11 @@ def render_sidebar(df: pd.DataFrame) -> dict:
     selections["dates"] = (start, end)
     selections["satisfaction"] = sb.slider("Satisfaction score", 1, 5, key="f_sat")
 
+    summary = active_filter_summary(selections, defaults)
     sb.divider()
     sb.markdown("**Active filters**")
-    sb.caption(active_filter_summary(selections, defaults))
-    return selections
+    sb.caption(summary)
+    return selections, summary
 
 
 def active_filter_summary(sel: dict, defaults: dict) -> str:
@@ -786,7 +822,10 @@ def render_about(raw: pd.DataFrame) -> None:
         "- Segment labels are attached to purchase lines; some customers appear under several "
         "segments, so segment figures describe lines, not people.\n"
         f"- Figures resting on fewer than {MIN_RELIABLE_N} lines are flagged as small samples.\n"
-        "- The data covers about five weeks of early 2023, so trends are directional."
+        "- The data covers about five weeks of early 2023, so trends are directional.\n"
+        "- The AI assistant never sees the raw rows. It receives a summary of the filtered data "
+        "(the KPI values and the segment, region, channel, category and weekly tables) computed "
+        "with the same functions as this dashboard."
     )
     with st.expander("Data-validation checks", expanded=False):
         st.dataframe(run_validation_checks(raw), hide_index=True, width="stretch")
@@ -797,7 +836,215 @@ def render_about(raw: pd.DataFrame) -> None:
 
 
 # =============================================================================
-# 8. MAIN APPLICATION
+# 8. AI DATA ASSISTANT (CHATBOT)
+# =============================================================================
+
+class AllModelsUnavailable(Exception):
+    """Raised when every configured model is retired or unknown."""
+
+
+def get_secret(name: str):
+    """Read one secret without crashing when no secrets file exists."""
+    try:
+        return st.secrets.get(name)
+    except Exception:
+        return None
+
+
+@st.cache_resource
+def get_client(api_key: str) -> OpenAI:
+    return OpenAI(api_key=api_key, base_url=GROQ_BASE_URL)
+
+
+def candidate_models() -> list:
+    """Configured model first (LLM_MODEL secret overrides), then fallbacks, no repeats."""
+    first = get_secret("LLM_MODEL") or DEFAULT_MODEL
+    return list(dict.fromkeys([first] + FALLBACK_MODELS))
+
+
+def is_model_unavailable_error(err: Exception) -> bool:
+    """True only for 'this model is retired / unknown' errors."""
+    message = str(err).lower()
+    return any(phrase in message for phrase in MODEL_UNAVAILABLE_PHRASES)
+
+
+def table_text(df: pd.DataFrame, column: str, label: str, sort_by_revenue: bool = True) -> str:
+    """Compact pipe-separated table for one dimension."""
+    data = summarize_by(df, column)
+    if sort_by_revenue:
+        data = data.sort_values("Revenue", ascending=False)
+    lines = [f"{label} | Revenue | Share | Lines | Customers | Avg purchase | Avg satisfaction | Lines rated <=2"]
+    for _, r in data.iterrows():
+        lines.append(
+            f"{r[column]} | {fmt_money(r['Revenue'])} | {r['RevenueShare']:.1%} | {int(r['Lines']):,} | "
+            f"{int(r['Customers']):,} | {fmt_money(r['AvgPurchase'])} | {r['AvgSatisfaction']:.2f} | "
+            f"{r['LowSatShare']:.1%}"
+        )
+    return "\n".join(lines)
+
+
+def build_data_context(df: pd.DataFrame, active_filters: str) -> str:
+    """Text summary of the filtered data sent to the model (no raw rows).
+    Uses the same functions as the KPI cards and charts, so numbers match the screen."""
+    k = compute_kpis(df)
+    parts = [
+        "ACTIVE FILTERS: " + active_filters.replace("  \n", "; "),
+        "",
+        "KPIs (same as the dashboard cards):",
+        f"Total revenue {fmt_money(k['revenue'])} | Purchase lines {k['lines']:,} | "
+        f"Unique customers {k['customers']:,} | Average purchase {fmt_money(k['avg_purchase'])} | "
+        f"Average satisfaction {k['avg_satisfaction']:.2f}/5 | "
+        f"Revenue from Decline lines {k['decline_rev_share']:.1%} | "
+        f"Lines rated <=2 {k['low_sat_share']:.1%}",
+        "",
+        "BY SEGMENT:",
+        table_text(df, "Segment", "Segment", sort_by_revenue=False),
+        "",
+        "BY REGION:",
+        table_text(df, "CustomerRegion", "Region"),
+        "",
+        "BY CHANNEL:",
+        table_text(df, "RetailChannel", "Channel"),
+        "",
+        "BY CATEGORY GROUP:",
+        table_text(df, "CategoryGroup", "Category group"),
+        "",
+        "REVENUE BY SEGMENT AND CHANNEL:",
+    ]
+    seg_ch = df.pivot_table(index="Segment", columns="RetailChannel", values="PurchaseAmount",
+                            aggfunc="sum", fill_value=0, observed=True)
+    seg_ch = seg_ch.reindex([s for s in SEGMENT_ORDER if s in seg_ch.index])
+    for seg, row in seg_ch.iterrows():
+        parts.append(f"{seg}: " + ", ".join(f"{ch} {fmt_money(v)}" for ch, v in row.items()))
+
+    parts += ["", "WEEKLY REVENUE (week starting Monday):"]
+    weekly = df.groupby("WeekStart").agg(Revenue=("PurchaseAmount", "sum"), Lines=("idx", "count"))
+    for week, row in weekly.iterrows():
+        parts.append(f"{week:%b %d, %Y}: {fmt_money(row['Revenue'])} from {int(row['Lines'])} lines")
+
+    parts += ["", f"FIVE HIGHEST-VALUE LINES RATED <= {LOW_SAT_THRESHOLD}:"]
+    low = df[df["LowSatisfaction"]].nlargest(5, "PurchaseAmount")
+    if low.empty:
+        parts.append("None in the current selection.")
+    for _, r in low.iterrows():
+        parts.append(
+            f"Customer {r['CustomerID']} | {r['TransactionDate']:%b %d, %Y} | {r['Segment']} | "
+            f"{r['CategoryGroup']} | {fmt_money(r['PurchaseAmount'])} | satisfaction {r['CustomerSatisfaction']} | "
+            f"{r['CustomerRegion']} | {r['RetailChannel']}"
+        )
+
+    multi = int((df.groupby("CustomerID")["Segment"].nunique() > 1).sum())
+    parts += [
+        "",
+        "DATA NOTES:",
+        f"- Sample: {len(df):,} purchase lines from {df['CustomerID'].nunique():,} customers, "
+        f"{df['TransactionDate'].min():%b %d, %Y} to {df['TransactionDate'].max():%b %d, %Y}.",
+        "- Each row is a purchase line, not a customer.",
+        f"- {multi} customers in this selection appear under more than one segment label.",
+        f"- Unlabeled lines in this selection: {int((df['Segment'] == UNLABELED).sum())}.",
+    ]
+    return "\n".join(parts)
+
+
+def stream_text(response):
+    """Yield only the answer text from a streamed response."""
+    for chunk in response:
+        if not chunk.choices:
+            continue
+        content = chunk.choices[0].delta.content
+        if content:
+            yield content
+
+
+def ask_model(client: OpenAI, messages: list) -> str:
+    """Stream an answer into the page, falling back to other models if one is retired."""
+    for model in candidate_models():
+        kwargs = dict(model=model, messages=messages, temperature=0.2, max_tokens=2000, stream=True)
+        if "gpt-oss" in model:
+            kwargs["reasoning_effort"] = "low"
+        try:
+            response = client.chat.completions.create(**kwargs)
+        except Exception as err:
+            if is_model_unavailable_error(err):
+                continue
+            raise
+        st.session_state["active_model"] = model
+        answer = st.write_stream(stream_text(response))
+        return answer if isinstance(answer, str) else "".join(map(str, answer or []))
+    raise AllModelsUnavailable()
+
+
+def friendly_error(err: Exception) -> str:
+    if isinstance(err, openai.AuthenticationError):
+        return "The API key was rejected. Please check the key saved in your Streamlit Secrets."
+    if isinstance(err, openai.RateLimitError):
+        return "The free-tier rate limit was reached. Please wait a minute and try again."
+    if isinstance(err, AllModelsUnavailable):
+        return ("None of the configured AI models are available. Add an LLM_MODEL secret with a "
+                "model currently listed in the Groq console.")
+    return f"Sorry, something went wrong contacting the AI service: {err}"
+
+
+def render_chatbot(filtered_df: pd.DataFrame, active_filters: str) -> None:
+    st.subheader("Ask the Data Assistant")
+    model_shown = st.session_state.get("active_model", candidate_models()[0])
+    st.caption(
+        f"Powered by {PROVIDER_NAME} · model {model_shown}. Answers are based on the data matching "
+        "your current sidebar filters. AI can make mistakes; verify key numbers with the KPI cards and charts."
+    )
+    st.session_state.setdefault("messages", [])
+    context = build_data_context(filtered_df, active_filters)
+
+    api_key = get_secret("GROQ_API_KEY")
+    if not api_key:
+        st.warning(
+            "The AI assistant is not set up yet. Add your Groq key in Streamlit Cloud: "
+            "**Manage app → ⋮ → Settings → Secrets**, then paste `GROQ_API_KEY = \"gsk_...\"` and save. "
+            "The rest of the dashboard works without it.",
+            icon="🔑",
+        )
+
+    pending = None
+    cols = st.columns(len(SUGGESTED_QUESTIONS) + 1)
+    for col, question in zip(cols, SUGGESTED_QUESTIONS):
+        if col.button(question, width="stretch", disabled=not api_key, help=question):
+            pending = question
+    if cols[-1].button("🗑️ Clear chat", width="stretch"):
+        st.session_state.messages = []
+
+    with st.expander("Data the assistant can see"):
+        st.caption("This exact summary is sent with every question. Compare it with the KPI cards and charts.")
+        st.code(context, language=None, wrap_lines=True)
+
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+
+    typed = st.chat_input("Ask a question about NovaRetail customers…", disabled=not api_key)
+    question = typed or pending
+    if not question:
+        return
+
+    st.session_state.messages.append({"role": "user", "content": question})
+    with st.chat_message("user"):
+        st.markdown(question)
+
+    with st.chat_message("assistant"):
+        try:
+            history = st.session_state.messages[-HISTORY_LENGTH:]
+            messages = [{"role": "system", "content": SYSTEM_PROMPT.format(context=context)}] + history
+            answer = ask_model(get_client(api_key), messages)
+            if not answer or not answer.strip():
+                answer = "The model returned an empty answer. Please try rephrasing your question."
+                st.markdown(answer)
+        except Exception as err:
+            answer = friendly_error(err)
+            st.error(answer)
+    st.session_state.messages.append({"role": "assistant", "content": answer})
+
+
+# =============================================================================
+# 9. MAIN APPLICATION
 # =============================================================================
 
 def main() -> None:
@@ -815,7 +1062,7 @@ def main() -> None:
     df = clean_data(raw)
 
     render_header(df)
-    selections = render_sidebar(df)
+    selections, filter_summary = render_sidebar(df)
     filtered = apply_filters(df, selections)
 
     if filtered.empty:
@@ -835,8 +1082,10 @@ def main() -> None:
     with tabs[3]:
         render_region_category_channel(filtered)
     with tabs[4]:
-        render_data_table(filtered)
+        render_chatbot(filtered, filter_summary)
     with tabs[5]:
+        render_data_table(filtered)
+    with tabs[6]:
         render_about(raw)
 
 
